@@ -1,0 +1,39 @@
+[project]
+name = "formal-geyser"
+version = "0.1.0"
+description = "FormalGeyser: task-driven formalization of mathematical literature in Lean"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "pydantic>=2.10,<3",
+  "httpx>=0.27,<1", "typer>=0.15,<1", "rich>=13,<15",
+  "portalocker>=3,<4", "jsonschema>=4,<5", "tomli-w>=1,<2", "pypdf>=5,<7", "pypdfium2>=4.30,<6"
+]
+[project.optional-dependencies]
+# Claude workers (Linux): the audited Agent SDK with its bundled Claude Code CLI.
+claude = ["claude-agent-sdk==0.2.163"]
+[project.scripts]
+formalizectl = "formal_geyser.cli:app"
+taskctl = "formal_geyser.coordination.cli:app"
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+[tool.hatch.build.targets.wheel]
+packages = ["src/formal_geyser"]
+[tool.hatch.build.targets.sdist]
+exclude = ["/archive", "/docs_archive"]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "hypothesis>=6,<7", "ruff>=0.11,<1", "mypy>=1,<2", "types-jsonschema"]
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["real_operator: checks operator requests without the in-process bypass"]
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+[tool.mypy]
+python_version = "3.13"
+check_untyped_defs = true
+ignore_missing_imports = true

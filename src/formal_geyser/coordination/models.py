@@ -1,0 +1,357 @@
+from __future__ import annotations
+
+import re
+from enum import StrEnum
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class Role(StrEnum):
+    OPERATOR = "operator"
+    WORKER = "worker"
+    RUNNER = "runner"
+    VALIDATOR = "validator"
+
+
+class Actor(StrictModel):
+    role: Role
+    worker_id: str | None = None
+    attempt_id: str | None = None
+    fencing_token: int | None = None
+
+
+class Limits(StrictModel):
+    packet_bytes: int = Field(default=32768, ge=512)
+    delta_bytes: int = Field(default=8192, ge=256)
+
+
+# The one Codex version whose app-server protocol this runtime was audited against.
+AUDITED_CODEX_VERSION = "0.160.0"
+
+
+class RoleEfforts(StrictModel):
+    """A reviewer's and the Integrator's effort where it differs from the backend's `effort`."""
+    review_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    integrator_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+
+    def effort_for(self, kind: str) -> str:
+        role = {"review": self.review_effort, "integrator": self.integrator_effort}.get(kind)
+        return role or getattr(self, "effort")
+
+
+def profile_entries(value: list[str], label: str) -> list[str]:
+    """Profile names: distinct, and usable as a directory name."""
+    if len(set(value)) != len(value):
+        raise ValueError(f"{label} profile names must be distinct")
+    for name in value:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}", name):
+            raise ValueError(f"A {label} profile name is 1 to 32 letters, digits, dots, dashes or underscores")
+    return value
+
+
+class CodexConfig(RoleEfforts):
+    home: str | None = Field(default=None, min_length=1)
+    executable: str = "codex"
+    version: str = AUDITED_CODEX_VERSION
+    model: str | None = None
+    effort: str = "high"
+    stop_grace_seconds: float = Field(default=10.0, gt=0)
+    max_frame_bytes: int = Field(default=67108864, ge=1024)
+    # Accounts used one at a time, in order of preference (see codex_profiles): the first is
+    # ``home`` itself, each other one ``home/profiles/<name>``. Empty: ``home`` alone, and a usage
+    # limit holds Codex until the operator resumes.
+    profiles: list[str] = Field(default_factory=list, max_length=32)
+
+    @field_validator("profiles")
+    @classmethod
+    def profile_entries(cls, value: list[str]) -> list[str]:
+        return profile_entries(value, "Codex")
+
+
+Backend = Literal["codex", "claude"]
+BACKENDS: tuple[str, ...] = ("codex", "claude")
+
+
+class ClaudeConfig(RoleEfforts):
+    """Claude Code driven through the pinned Agent SDK, billed only to a Claude subscription.
+
+    ``home`` is the CLAUDE_CONFIG_DIR in which the operator signed in once with ``/login``;
+    further sign-ins are ``profiles``. The runtime never reads or forwards a credential and
+    refuses API-key billing.
+    """
+    home: str | None = Field(default=None, min_length=1)
+    # None selects the Claude Code binary bundled with the pinned SDK.
+    executable: str | None = Field(default=None, min_length=1)
+    sdk_version: str = "0.2.163"
+    cli_version: str = "2.1.286"
+    model: str | None = None
+    effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
+    # Hosts sandboxed commands may reach; "*" allows every non-local host.
+    allowed_domains: list[str] = Field(default_factory=lambda: ["*"])
+    stop_grace_seconds: float = Field(default=10.0, gt=0)
+    max_frame_bytes: int = Field(default=67108864, ge=1024)
+    # Subscription sign-ins used one at a time, in order of preference (see claude_profiles): the
+    # first is ``home`` itself, each other one ``home/profiles/<name>``. Empty: ``home`` alone.
+    profiles: list[str] = Field(default_factory=list, max_length=32)
+
+    @field_validator("profiles")
+    @classmethod
+    def profile_entries(cls, value: list[str]) -> list[str]:
+        return profile_entries(value, "Claude")
+
+    @field_validator("allowed_domains")
+    @classmethod
+    def domain_entries(cls, value: list[str]) -> list[str]:
+        for entry in value:
+            if not entry or len(entry) > 253 or any(ch.isspace() or ch in "/\\\"'" for ch in entry):
+                raise ValueError("Allowed domains must be host names, wildcard patterns, or '*'")
+        return value
+
+
+class RepositoryConfig(StrictModel):
+    enabled: bool = False
+    branch: str = Field(default="main", min_length=1, max_length=200)
+    executable: str = Field(default="git", min_length=1, max_length=4000)
+
+    @field_validator("branch")
+    @classmethod
+    def branch_name(cls, value: str) -> str:
+        from .git_transport import validate_branch
+
+        return validate_branch(value)
+
+
+class GitSyncConfig(StrictModel):
+    enabled: bool = False
+    remote: str | None = Field(default=None, min_length=1, max_length=4000)
+    poll_seconds: float = Field(default=15.0, ge=1, le=3600)
+    timeout_seconds: float = Field(default=60.0, ge=1, le=600)
+    credential_helper: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
+
+    @field_validator("remote")
+    @classmethod
+    def remote_location(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        from .git_transport import normalize_remote
+
+        return normalize_remote(value)
+
+    @model_validator(mode="after")
+    def configured_remote(self):
+        if self.enabled and self.remote is None:
+            raise ValueError("Enabled Git synchronization requires a configured remote")
+        return self
+
+
+class LeanServiceConfig(StrictModel):
+    """The project's Lean service, which starts every Lean and Lake process (lean_service)."""
+    threads: int | None = Field(default=None, ge=1, le=1024)  # Thread capacity; default: logical cores.
+    reserve_gib: float = Field(default=4, ge=0, allow_inf_nan=False)  # Kept free for the system and agents.
+    commit_reserve_gib: float = Field(default=8, ge=0, allow_inf_nan=False)
+    low_watermark_gib: float = Field(default=3, ge=0, allow_inf_nan=False)  # Below it nothing new starts.
+    critical_watermark_gib: float = Field(default=1.5, ge=0, allow_inf_nan=False)  # Below it a job is suspended.
+    per_owner: int = Field(default=2, ge=1, le=64)  # Running jobs per worker within a class.
+    aging_minutes: float = Field(default=20, gt=0, allow_inf_nan=False)
+    # Blocking validations that may run at once ahead of interactive checks.
+    validation_slots: int = Field(default=4, ge=0, le=64)
+    sandbox: Literal["codex", "none"] = "codex"
+    warm_gib: float = Field(default=6, ge=0, allow_inf_nan=False)  # Library .olean pages kept resident.
+    sessions: int = Field(default=6, ge=0, le=64)  # Resident development-check sessions; 0 turns them off.
+    session_idle_minutes: float = Field(default=10, gt=0, allow_inf_nan=False)
+    # A development check, or a validation, that has not ended after this long is stopped and
+    # ends unavailable (0: no limit); its suspended time does not count. Lean's heartbeat limit
+    # bounds each declaration's elaboration; this bounds what it cannot, such as a kernel
+    # reduction, and the inspection and kernel replay that run without heartbeats. In the Linux
+    # pilot the longest of 1,198 development checks took 11 minutes, of 210 validations 13.
+    check_minutes: float = Field(default=30, ge=0, allow_inf_nan=False)
+    validation_minutes: float = Field(default=60, ge=0, allow_inf_nan=False)
+    # A check one of whose Lean processes holds more private memory than this (resident or
+    # swapped out) is stopped and ends unavailable, as one past its time (0: no limit). In the
+    # Linux pilot two inspections grew past 8 GB, the machine's memory ran out, every check was
+    # stopped and queued again, and they started over first: no check ended for 12 minutes. Of
+    # 11,500 checks there that ended, the largest held 13.9 GB in all, all but three less than 9.
+    process_memory_gib: float = Field(default=12, ge=0, allow_inf_nan=False)
+    # How long a submission waits for its validation before the validation continues in the
+    # background and its result arrives as a notification.
+    validation_wait_seconds: float = Field(default=90, ge=0, allow_inf_nan=False)
+
+
+Effort = Literal["low", "medium", "high", "xhigh", "max"]
+
+
+class DecisionConfig(StrictModel):
+    """The cheap model that decides task assignment and recruitment, each decision in a new,
+    small conversation without tools. The operator's recorded choice overrides it."""
+    model: str = Field(default="gpt-6.1-sol", min_length=1, max_length=200)
+    effort: Effort = "high"
+
+
+RotationMode = Literal["conservative", "aggressive"]
+
+
+class RotationConfig(StrictModel):
+    """When a conversation is replaced by a new one that continues the same task. Conservative
+    rotates a conversation idle for idle_minutes; aggressive also rotates one whose context
+    exceeds context_tokens. The operator's recorded choice overrides the mode."""
+    mode: RotationMode = "conservative"
+    idle_minutes: int = Field(default=40, ge=1, le=24 * 60)
+    context_tokens: int = Field(default=100_000, ge=20_000, le=1_000_000)
+
+
+class AssignmentConfig(StrictModel):
+    """The backend and rotation mode each new agent gets, by role. A list applies by worker
+    number and repeats: Worker 0 takes its first entry, Worker 1 the next. What this leaves
+    open follows the operator's backend choice and the project's rotation mode; the operator
+    can still change an agent's mode later."""
+    worker_backends: list[Backend] = Field(default_factory=list, max_length=64)
+    worker_rotation: list[RotationMode] = Field(default_factory=list, max_length=64)
+    reviewer_backend: Backend | None = None
+    reviewer_rotation: RotationMode | None = None
+    integrator_backend: Backend | None = None
+
+    def backend(self, kind: str, number: int | None) -> Backend | None:
+        if kind == "ordinary":
+            return self.worker_backends[number % len(self.worker_backends)] if (
+                self.worker_backends and number is not None) else None
+        return {"review": self.reviewer_backend, "integrator": self.integrator_backend}.get(kind)
+
+    def rotation(self, kind: str, number: int | None) -> RotationMode | None:
+        if kind == "review":
+            return self.reviewer_rotation
+        if kind != "ordinary" or not self.worker_rotation or number is None:
+            return None
+        return self.worker_rotation[number % len(self.worker_rotation)]
+
+
+class ConcurrencyConfig(StrictModel):
+    """How many sessions may run at once on each backend's account; -1 sets no limit, and 0
+    starts no worker session. An ordinary worker beyond it waits for a free one. Reviewers and
+    the Integrator are admitted anyway, since accepted work waits on them, and count; decision
+    helpers do not count.
+    While dispatch ramps up, an account's ordinary worker sessions start launch_seconds after
+    its previous one, so a large project does not start all at once: until the account first
+    fills, or launch_ramp_minutes after the service starts or the run starts or resumes
+    (0: until it fills), whichever comes first."""
+    codex: int = Field(default=-1, ge=-1, le=1024)
+    claude: int = Field(default=-1, ge=-1, le=1024)
+    launch_seconds: float = Field(default=0, ge=0, le=3600, allow_inf_nan=False)
+    launch_ramp_minutes: float = Field(default=10, ge=0, le=24 * 60, allow_inf_nan=False)
+
+
+class ProjectConfig(StrictModel):
+    schema_version: Literal[1] = 1
+    name: str = "FormalGeyser"
+    domain: str = "general"
+    collaboration_mode: Literal["collaborative"] = "collaborative"
+    limits: Limits = Field(default_factory=Limits)
+    codex: CodexConfig = Field(default_factory=CodexConfig)
+    claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
+    # The initial choice for fresh workers; the operator's recorded switch overrides it.
+    # The assignment plan, where it names a backend, overrides both.
+    new_worker_backend: Backend = "codex"
+    assignment: AssignmentConfig = Field(default_factory=AssignmentConfig)
+    concurrency: ConcurrencyConfig = Field(default_factory=ConcurrencyConfig)
+    repository: RepositoryConfig = Field(default_factory=RepositoryConfig)
+    sync: GitSyncConfig = Field(default_factory=GitSyncConfig)
+    environment: dict[str, Any] = Field(default_factory=dict)
+    lean_service: LeanServiceConfig = Field(default_factory=LeanServiceConfig)
+    decisions: DecisionConfig = Field(default_factory=DecisionConfig)
+    rotation: RotationConfig = Field(default_factory=RotationConfig)
+
+    @model_validator(mode="after")
+    def sync_repository(self):
+        if self.sync.enabled and not self.repository.enabled:
+            raise ValueError("Git synchronization requires the managed repository to be enabled")
+        return self
+
+    def backend_config(self, backend: str) -> CodexConfig | ClaudeConfig:
+        if backend == "codex":
+            return self.codex
+        if backend == "claude":
+            return self.claude
+        raise ValueError(f"Unknown native backend: {backend}")
+
+    def runtime_profile(self, backend: str) -> dict[str, Any]:
+        """The identity a native session is bound to; Codex keeps its historical shape."""
+        if backend == "claude":
+            return {"backend": "claude", **self.claude.model_dump(mode="json")}
+        return self.backend_config(backend).model_dump(mode="json")
+
+
+class Requirement(StrictModel):
+    key: str = Field(min_length=1, max_length=128)
+    task_id: str | None = None
+    task_revision: int | None = Field(default=None, ge=1)
+    artifact_id: str | None = None
+    policy: str = Field(min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def one_provider(self):
+        if (self.task_id is None) == (self.artifact_id is None):
+            raise ValueError("Specify exactly one task or artifact provider")
+        if self.task_id and self.task_revision is None:
+            raise ValueError("Task providers require an exact revision")
+        return self
+
+
+# A task objective or context that is only a file name, such as "objective.md": the stored
+# task.json names its own files so, and a contract copied from one would name no target.
+CONTRACT_FILE_NAME = re.compile(r"\s*[\w./-]{1,200}\.(?:md|markdown|txt|json)\s*", re.ASCII)
+
+
+def file_name_fields(contract: Any) -> list[str]:
+    """The objective or context fields of a contract (model or mapping) that are a file name."""
+    fields = []
+    for field in ("objective", "context"):
+        value = contract.get(field) if isinstance(contract, dict) else getattr(contract, field, None)
+        if isinstance(value, str) and CONTRACT_FILE_NAME.fullmatch(value):
+            fields.append(field)
+    return fields
+
+
+class TaskContract(StrictModel):
+    title: str = Field(min_length=1, max_length=300)
+    objective: str = Field(min_length=1, max_length=20000)
+    domain: str = "general"
+    kind: str = "work"
+    acceptance_policy: str = "general.peer@1"
+    inputs: list[str] = Field(default_factory=list, max_length=200)
+    requirements: list[Requirement] = Field(default_factory=list, max_length=128)
+    constraints: list[str] = Field(default_factory=list, max_length=100)
+    context: str = Field(default="", max_length=40000)
+    priority: int = Field(default=1, ge=0, le=3)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class Predicate(StrictModel):
+    mode: Literal["all", "any"] = "all"
+    requirements: list[Requirement] = Field(default_factory=list, max_length=128)
+    # Staged candidates whose machine validation result, whatever its verdict, is awaited.
+    validations: list[str] = Field(default_factory=list, max_length=20)
+    external_response_id: str | None = Field(default=None, min_length=1)
+    completion_declaration_id: str | None = Field(default=None, min_length=1)
+
+
+class Checkpoint(StrictModel):
+    summary: str = Field(min_length=1, max_length=20000)
+    next_action: str = Field(min_length=1, max_length=5000)
+    input_refs: list[str] = Field(default_factory=list, max_length=200)
+
+
+class ValidationReport(StrictModel):
+    verdict: Literal["accepted", "rejected", "needs_operator", "unavailable"]
+    policy: str
+    details: dict[str, Any] = Field(default_factory=dict)
+    qualifications: list[str] = Field(default_factory=list)
+
+
+class Command(StrictModel):
+    name: str
+    key: str = Field(min_length=1, max_length=200)
+    payload: dict[str, Any] = Field(default_factory=dict)

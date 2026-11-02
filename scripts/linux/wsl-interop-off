@@ -1,0 +1,12 @@
+#!/bin/sh
+# Turn WSL interop off again if something turned it back on. /etc/wsl.conf ([interop]
+# enabled=false) applies only when the distribution starts; WSL can register its Windows
+# interpreter again later, as when binfmt_misc is mounted anew. Interop lets a sandboxed
+# command start Windows programs outside the sandbox. Run as root by wsl-interop-off.timer.
+for entry in /proc/sys/fs/binfmt_misc/WSLInterop*; do
+    [ -e "$entry" ] || continue
+    if head -n 1 "$entry" | grep -q '^enabled'; then
+        echo 0 > "$entry" && echo "Turned $entry off"
+    fi
+done
+exit 0

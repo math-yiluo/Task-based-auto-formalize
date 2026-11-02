@@ -1,0 +1,10 @@
+[Unit]
+Description=Check every 15 seconds that WSL interop is still off
+
+[Timer]
+OnBootSec=5s
+OnUnitActiveSec=15s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

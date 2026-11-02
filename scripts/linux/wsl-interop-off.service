@@ -1,0 +1,6 @@
+[Unit]
+Description=Turn WSL interop off again if something turned it back on
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wsl-interop-off

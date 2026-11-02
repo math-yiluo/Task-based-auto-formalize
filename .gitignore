@@ -1,0 +1,20 @@
+.venv/
+.tools/
+.task-based/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.claude/
+*.olean
+*.ilean
+.lake/
+
+# Local live workload state and external dependency checkouts
+live-runs/
+
+# Native checker scratch workspaces created by opt-in real checker tests
+/lc-*/
